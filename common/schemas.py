@@ -136,4 +136,5 @@ class ReviewState(TypedDict, total=False):
 
     # Populated by commit / final nodes
     posted_comment_body: str | None
+    posted_comment_url: str | None
     final_action: str | None

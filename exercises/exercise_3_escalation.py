@@ -16,6 +16,7 @@ from langgraph.types import Command, interrupt
 from rich.console import Console
 from rich.panel import Panel
 
+from common.db import checkpoint_serde
 from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
 from common.schemas import (
@@ -27,6 +28,43 @@ from common.schemas import (
 
 
 console = Console()
+
+SYSTEM_PROMPT = """You are a senior software engineer reviewing a GitHub pull request.
+Return a structured review:
+- summary: one paragraph on what the PR does.
+- risk_factors: concrete risks (security, data/schema migration, correctness, missing tests).
+- comments: specific, actionable review comments (file, line from the diff hunk when known, severity).
+- confidence: a calibrated probability (0.0-1.0) that your review is complete and correct,
+  i.e. the PR can be handled without further human judgment.
+- confidence_reasoning: why you picked that confidence value; name the rule you applied.
+
+Confidence rules (apply the FIRST that matches, these are hard limits):
+  1. Any security red flag -> confidence MUST be between 0.30 and 0.50.
+     Red flags: weak/fast password hashing (MD5, SHA1, unsalted), secrets or tokens stored
+     in plaintext, SQL built with string formatting/concatenation, hard-coded credentials
+     or user ids, auth/session logic, plain-HTTP network calls carrying user data.
+  2. A reasonable feature with an open design question a human must decide (schema/data
+     migration, backwards compatibility, missing tests for new logic) -> 0.60 to 0.70.
+  3. Trivial or mechanical change (typo, docs, formatting, dependency bump) with no open
+     questions -> 0.85 to 0.95.
+
+Escalation: if confidence < 0.58, populate escalation_questions with 2-4 specific,
+context-rich questions for the human reviewer. Each question must reference the file and
+function/section of the diff it is about and explain why the answer matters, e.g.
+"auth.py `hash_password` uses MD5 - is this a placeholder, or should it move to bcrypt/argon2
+before merge?". Otherwise leave escalation_questions empty."""
+
+SYNTHESIZE_PROMPT = """You are a senior software engineer finalising a pull-request review.
+You get the diff, your own initial structured analysis, and a human reviewer's answers to
+the questions you escalated. Produce a refined structured review:
+- Treat the reviewer's answers as authoritative context about intent and constraints.
+- Keep every comment that is still valid, drop ones the answers resolve, and add comments for
+  anything the answers reveal. Security problems in the code stay as blockers unless the
+  reviewer explicitly says they are out of scope.
+- confidence: how sure you now are that this review is complete and correct. With the
+  questions answered it should normally be higher than before.
+- confidence_reasoning: explain how the answers changed your assessment.
+- escalation_questions: leave empty."""
 
 
 def node_fetch_pr(state):
@@ -42,12 +80,12 @@ def node_analyze(state):
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Title: {state['pr_title']}\n"
+                f"Files: {', '.join(state['pr_files'])}\n\n"
+                f"Diff:\n{state['pr_diff']}"
             )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
     return {"analysis": analysis}
@@ -71,22 +109,37 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    console.print("[cyan]→ synthesize[/cyan]")
+    initial = state["analysis"]
+    qa = "\n".join(f"Q: {q}\nA: {ans}" for q, ans in (state.get("escalation_answers") or {}).items())
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke([
+            {"role": "system", "content": SYNTHESIZE_PROMPT},
+            {"role": "user", "content": (
+                f"Title: {state['pr_title']}\n\n"
+                f"Diff:\n{state['pr_diff']}\n\n"
+                f"Initial analysis (JSON):\n{initial.model_dump_json(indent=2)}\n\n"
+                f"Reviewer Q&A:\n{qa}"
+            )},
+        ])
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%} "
+                  f"(was {initial.confidence:.0%}), {len(refined.comments)} comment(s)")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,8 +214,9 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
-    return g.compile(checkpointer=MemorySaver())
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
+    return g.compile(checkpointer=MemorySaver(serde=checkpoint_serde()))
 
 
 def handle_interrupt(payload):

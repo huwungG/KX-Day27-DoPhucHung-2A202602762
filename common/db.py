@@ -15,11 +15,24 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aiosqlite
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from common.schemas import AuditEntry
 
 
 SCHEMA_FILE = Path(__file__).resolve().parent.parent / "audit" / "schema.sql"
+
+
+def checkpoint_serde() -> JsonPlusSerializer:
+    """Checkpoint serializer that explicitly allows our Pydantic state types.
+
+    Without this LangGraph warns that `PRAnalysis` is an unregistered type
+    (and will block it in a future version).
+    """
+    return JsonPlusSerializer(allowed_msgpack_modules=[
+        ("common.schemas", "PRAnalysis"),
+        ("common.schemas", "ReviewComment"),
+    ])
 
 
 def db_path() -> str:
